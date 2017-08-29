@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Pipeline delete tool                                       doru@rocketmail.com
+#
+# Usage: dp <pipeline>|<pipeline file>
+
+# Enforce shell code robustness.
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Show line numbers when tracing execution.
+readonly PS4='${LINENO}:+ '
+
+log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+#-------------------------------------------------------------------------------
+
+if [ -z "${*:-}" ]; then
+  pipelines=(chatbus flaskapp dr_check)
+else
+  pipelines=($@)
+fi
+
+for pipeline in "${pipelines[@]}"; do
+  pipeline="${pipeline##*/}"
+  pipeline="${pipeline%.yml}"
+  log "Deleting pipeline ${pipeline}"
+  fly -t . dp -np "${pipeline}"
+done

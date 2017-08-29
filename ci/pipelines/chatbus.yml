@@ -1,0 +1,549 @@
+# DevOps pipeline for Erlang applications.
+#-------------------------------------------------------------------------------
+resources:
+- name: alpine-image
+  type: docker-image
+  source:
+    repository: alpine
+    tag: 3.6
+
+- name: alpine-tools-image
+  type: docker-image
+  source:
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/alpine-tools
+
+- name: chatbus-src
+  type: git
+  source:
+    uri: https://github.com/beamX/chatBus
+
+- name: chatbus-image
+  type: docker-image
+  source:
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/chatbus
+
+# Erlang 20 release + rebar & rebar3
+- name: docker-erlang-otp-src
+  type: git
+  source:
+    uri: https://github.com/c0b/docker-erlang-otp
+
+- name: docker-erlang-otp-image
+  type: docker-image
+  source:
+    tag: 20
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/docker-erlang-otp
+
+- name: docker-erlang-otp-tools-image
+  type: docker-image
+  source:
+    tag: 20-tools
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/docker-erlang-otp
+
+#-------------------------------------------------------------------------------
+jobs:
+- name: alpine-tools-image-build
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+  - aggregate:
+    - task: mkdockerfile
+      image: alpine-image
+      timeout: 5m
+      config:
+        platform: linux
+        outputs:
+        - name: docker
+        run:
+          path: sh
+          args:
+          - -uec
+          - |
+            cat >docker/Dockerfile <<EOF
+            FROM alpine:3.6
+            RUN apk --no-cache add curl jq less openssh
+            CMD /bin/sh
+            EOF
+            cat docker/Dockerfile
+  - put: alpine-tools-image
+    params:
+      build: docker/
+      tag_as_latest: true
+
+- name: docker-erlang-otp-image-build
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: docker-erlang-otp-src
+      trigger: true
+  - task: mktag
+    image: alpine-image
+    timeout: 3m
+    config:
+      platform: linux
+      outputs:
+      - name: tag
+      run:
+        path: sh
+        args:
+        - -xuec
+        - echo '20' > tag/value
+  - put: docker-erlang-otp-image
+    params:
+      build: docker-erlang-otp-src/20
+      tag: tag/value
+
+- name: docker-erlang-otp-tools-image-build
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: docker-erlang-otp-image
+      passed: ['docker-erlang-otp-image-build']
+      trigger: true
+  - aggregate:
+    - task: mktag
+      image: alpine-image
+      timeout: 3m
+      config:
+        platform: linux
+        outputs:
+        - name: tag
+        run:
+          path: sh
+          args:
+          - -xuec
+          - echo '20-tools' >tag/value
+    - task: mkdockerfile
+      image: alpine-image
+      timeout: 5m
+      config:
+        platform: linux
+        inputs:
+        - name: docker-erlang-otp-image
+        outputs:
+        - name: docker
+        params:
+          DOCKER_REGISTRY_HOST: ((docker_registry_host))
+        run:
+          path: sh
+          args:
+          - -uec
+          - |
+            # Create a docker-compose.yml refering to the exact application image.
+            digest=$(cat docker-erlang-otp-image/digest)
+            repository=$(cat docker-erlang-otp-image/repository)
+            cat >docker/Dockerfile <<EOF
+              FROM ${DOCKER_REGISTRY_HOST}/docker-erlang-otp:20
+              RUN apt-get update && \
+                apt-get install -y git make jq less && \
+                rm -rf /var/lib/apt/lists/* /var/cache/apt/archives
+              CMD /bin/sh
+            EOF
+            cat docker/Dockerfile
+  - put: docker-erlang-otp-tools-image
+    params:
+      build: docker/
+      tag: tag/value
+
+- name: chatbus-build
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: chatbus-src
+      trigger: true
+    - get: docker-erlang-otp-tools-image
+      passed: ['docker-erlang-otp-tools-image-build']
+      trigger: true
+  - task: build
+    image: docker-erlang-otp-tools-image
+    timeout: 10m
+    input_mapping:
+      src: chatbus-src
+    output_mapping:
+      _build: _build
+    config:
+      platform: linux
+      inputs:
+      - name: src
+      outputs:
+      - name: _build
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+          log "Build started"
+          cd src/
+          ./rebar3 new release chatbus
+          make compile || ./rebar3 update
+          make
+          log "Runing EUnit tests"
+          ./rebar3 eunit
+          # Ignore dyalizer errors for now
+          # ./rebar3 dialyzer || true
+          cp -a _build/* ../_build
+  - task: mkdockerfile
+    image: alpine-image
+    timeout: 3m
+    input_mapping:
+      _build: _build
+      docker-erlang-otp-tools-image: docker-erlang-otp-tools-image
+    config:
+      platform: linux
+      inputs:
+      - name: _build
+      - name: docker-erlang-otp-tools-image
+      outputs:
+      - name: docker
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          cp -a _build docker/
+          # Create a Dockerfile using the exact application image.
+          digest=$(cat docker-erlang-otp-tools-image/digest)
+          repository=$(cat docker-erlang-otp-tools-image/repository)
+          cat >docker/Dockerfile <<EOF
+          FROM ${repository}@${digest}
+          ADD _build/default/rel /rel
+          CMD /rel/chatbus/bin/chatbus console
+          ENTRYPOINT /rel/chatbus/bin/chatbus foreground
+          EOF
+          cat docker/Dockerfile
+  - put: chatbus-image
+    params:
+      build: docker/
+      tag_as_latest: true
+
+# The deploy job performs a docker app deployment on targeted host. This allows
+# for a much cleaner destroy code and preserves the host environment cleanliness.
+- name: docker-deploy
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: chatbus-image
+      passed: ['chatbus-build']
+      trigger: true
+      params:
+        skip_download: true
+    - get: alpine-tools-image
+      passed: ['alpine-tools-image-build']
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+      CI_USERNAME: ((ci_minion_username))
+      CI_PRIVKEY: ((ci_minion_privkey))
+      CI_PUBKEY: ((ci_minion_pubkey))
+      CI_KNOWN_HOSTS: ((ci_minion_known_hosts))
+      DOCKER_REGISTRY_HOSTNAME: ((docker_registry_host))
+      DOCKER_REGISTRY_USERNAME: ((docker_registry_username))
+      DOCKER_REGISTRY_PASSWORD: ((docker_registry_password))
+    config:
+      platform: linux
+      inputs:
+      - name: chatbus-image
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          : "${CI_HOST}" "${CI_USERNAME}" "${CI_PRIVKEY}" "${CI_KNOWN_HOSTS}"
+          : "${DOCKER_REGISTRY_HOSTNAME}" "${DOCKER_REGISTRY_USERNAME}" "${DOCKER_REGISTRY_PASSWORD}"
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+          log "Authorize job container to CI deployment minion"
+          mkdir -p "${HOME}/.ssh"
+          echo "${CI_PRIVKEY}" > "${HOME}/.ssh/ci_rsa"
+          chmod 0400 "${HOME}/.ssh/ci_rsa"
+          echo "${CI_PUBKEY}" > "${HOME}/.ssh/ci_rsa.pub"
+          echo "${CI_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+
+          # Verify that we can connect.
+          log "Using testbed host:"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" uname -a
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" \
+            docker login "${DOCKER_REGISTRY_HOSTNAME}" \
+            -u "${DOCKER_REGISTRY_USERNAME}" \
+            -p "${DOCKER_REGISTRY_PASSWORD}"
+
+          log 'Generating docker-compose.yml'
+          # Create a docker-compose.yml refering to the exact application image.
+          digest=$(cat chatbus-image/digest)
+          repository=$(cat chatbus-image/repository)
+          cat >docker-compose.yml <<EOF
+          # Docker compose file for chatbus application container
+          version: '3.1'
+          networks:
+            chatbus:
+              driver: bridge
+          services:
+            chatbus:
+              image: ${repository}@${digest}
+              ports:
+              - 9090:9090
+              networks:
+              - chatbus
+          EOF
+          cat docker-compose.yml
+
+          log 'Upload docker-compose.yml to testbed host'
+          scp -i "${HOME}/.ssh/ci_rsa" -r docker-compose.yml "${CI_USERNAME}@${CI_HOST}:"
+
+          log 'Starting chatbot application container'
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" docker-compose rm -fsv
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" docker-compose up -d --remove-orphans
+
+          log "Wait for application service to come alive at http://${CI_HOST}:9090"
+          ret=0; until [ "${ret}" -eq 200 ]; do
+            sleep 3
+            ret="$(curl --connect-timeout 3 -w '%{http_code}' -so /dev/null http://${CI_HOST}:9090)" || true
+            echo -n "${ret} "
+          done
+          echo OK
+
+          log 'Capture 10 second of application startup log detail before exiting'
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" docker-compose logs -f &
+          sleep 10
+
+# Dockerized deployment test.
+- name: docker-test
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-tools-image
+      passed: ['alpine-tools-image-build']
+    - get: chatbus-image
+      passed: ['docker-deploy']
+      trigger: true
+      params:
+        skip_download: true
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+          log "Testing chatbot app"
+          log "- curl connection test"
+          ret="$(curl --connect-timeout 3 -w '%{http_code}' -so /dev/null http://${CI_HOST}:9090)" || ret=$?
+          if [ "${ret}" -eq 200 ]; then
+            log "PASS ${ret}"
+          else
+            log "FAIL ${ret}"
+            exit 1
+          fi
+
+# Dockerized deployment teardown.
+- name: docker-destroy
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-tools-image
+      passed: ['alpine-tools-image-build']
+    - get: chatbus-image
+      passed: ['docker-test']
+      trigger: true
+      params:
+        skip_download: true
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+      CI_USERNAME: ((ci_minion_username))
+      CI_PRIVKEY: ((ci_minion_privkey))
+      CI_KNOWN_HOSTS: ((ci_minion_known_hosts))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          : "${CI_HOST}" "${CI_USERNAME}" "${CI_PRIVKEY}" "${CI_KNOWN_HOSTS}"
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+          log "Authorize job container to CI deployment minion"
+          mkdir -p "${HOME}/.ssh"
+          echo "${CI_PRIVKEY}" > "${HOME}/.ssh/ci_rsa"
+          chmod 0400 "${HOME}/.ssh/ci_rsa"
+          echo "${CI_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+
+          # Verify that we can connect.
+          log "Using testbed host:"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" uname -a
+
+          if ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" test -f docker-compose.yml; then
+            log 'Stopping chatbot application container'
+            ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'docker-compose rm -fsv'
+            ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'rm docker-compose.yml'
+          else
+           log 'Host is clean. There is no docker-compose.yml file on it.'
+          fi
+
+# The deploy-blob job performs native deployment on targeted host.
+- name: blob-deploy
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - get: chatbus-image
+    passed: ['chatbus-build']
+  - task: main
+    image: chatbus-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+      CI_USERNAME: ((ci_minion_username))
+      CI_PRIVKEY: ((ci_minion_privkey))
+      CI_KNOWN_HOSTS: ((ci_minion_known_hosts))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          : "${CI_HOST}" "${CI_USERNAME}" "${CI_PRIVKEY}" "${CI_KNOWN_HOSTS}"
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+          log "Authorize job container to CI deployment minion"
+          mkdir -p "${HOME}/.ssh"
+          echo "${CI_PRIVKEY}" > "${HOME}/.ssh/ci_rsa"
+          chmod 0400 "${HOME}/.ssh/ci_rsa"
+          echo "${CI_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+
+          # Verify that we can connect
+          log "Using testbed host:"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" uname -a
+
+          log "Stop running app and epmd"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" \
+            'test -f rel/chatbus/bin/chatbus && rel/chatbus/bin/chatbus stop' || \
+            log "Application is not running: $?"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'sudo killall epmd'
+
+          # TODO: Also stop the edpm service. Subsequent runs will fail otherwise.
+          log 'Upload the Erlang application release blob'
+          scp -i "${HOME}/.ssh/ci_rsa" -qr /rel "${CI_USERNAME}@${CI_HOST}:"
+
+          log 'Starting chatbot application'
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" rel/chatbus/bin/chatbus start
+
+          log "Wait for application service to come alive at http://${CI_HOST}:9090"
+          ret=0; until [ "${ret}" -eq 200 ]; do
+            sleep 3
+            ret="$(curl --connect-timeout 3 -w '%{http_code}' -so /dev/null http://${CI_HOST}:9090)" || true
+            echo -n "${ret} "
+          done
+          echo OK
+
+# Dockerized deployment test.
+- name: blob-test
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-tools-image
+      passed: ['alpine-tools-image-build']
+    - get: chatbus-image
+      passed: ['blob-deploy']
+      trigger: true
+      params:
+        skip_download: true
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+          log "Testing chatbot app"
+          log "- curl connection test"
+          ret="$(curl --connect-timeout 3 -w '%{http_code}' -so /dev/null http://${CI_HOST}:9090)" || ret=$?
+          if [ "${ret}" -eq 200 ]; then
+            log "PASS ${ret}"
+          else
+            log "FAIL ${ret}"
+            exit 1
+          fi
+
+# The blob-deploy job performs native deployment on targeted host.
+- name: blob-destroy
+  public: ((chatbus_public))
+  serial: true
+  plan:
+  - get: chatbus-image
+    passed: ['blob-test']
+    trigger: true
+  - task: main
+    image: chatbus-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+      CI_USERNAME: ((ci_minion_username))
+      CI_PRIVKEY: ((ci_minion_privkey))
+      CI_KNOWN_HOSTS: ((ci_minion_known_hosts))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          : "${CI_HOST}" "${CI_USERNAME}" "${CI_PRIVKEY}" "${CI_KNOWN_HOSTS}"
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+          log "Authorize job container to CI deployment minion"
+          mkdir -p "${HOME}/.ssh"
+          echo "${CI_PRIVKEY}" > "${HOME}/.ssh/ci_rsa"
+          chmod 0400 "${HOME}/.ssh/ci_rsa"
+          echo "${CI_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+
+          # Verify that we can connect
+          log "Using testbed host:"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" uname -a
+
+          log "Stop running app and epmd"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'test -f rel/chatbus/bin/chatbus && rel/chatbus/bin/chatbus stop' || \
+            log "Application is not running: $?"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'sudo killall epmd'

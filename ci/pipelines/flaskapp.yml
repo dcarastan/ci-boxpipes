@@ -1,0 +1,216 @@
+# Fictional product devops pipeline for docker Compose getting started containers.
+# https://docs.docker.com/compose/gettingstarted/
+
+resources:
+- name: alpine-tools-image
+  type: docker-image
+  source:
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: carastan.com/alpine-tools
+
+- name: flaskapp-src
+  type: git
+  source:
+    uri: https://github.com/zouzias/docker-compose-flask-example
+
+- name: flaskapp-image
+  type: docker-image
+  source:
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: carastan.com/flaskapp
+
+#-------------------------------------------------------------------------------
+jobs:
+- name: flaskapp-image-build
+  serial: true
+  plan:
+  - get: flaskapp-src
+    trigger: true
+  - put: flaskapp-image
+    params:
+      build: flaskapp-src/
+      tag_as_latest: true
+
+# The deploy job performs a docker app deployment on targeted host.
+- name: docker-deploy
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-tools-image
+    - get: flaskapp-image
+      passed: ['flaskapp-image-build']
+      trigger: true
+      params:
+        skip_download: true
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+      CI_USERNAME: ((ci_minion_username))
+      CI_PRIVKEY: ((ci_minion_privkey))
+      CI_PUBKEY: ((ci_minion_pubkey))
+      CI_KNOWN_HOSTS: ((ci_minion_known_hosts))
+      DOCKER_REGISTRY_HOSTNAME: ((docker_registry_host))
+      DOCKER_REGISTRY_USERNAME: ((docker_registry_username))
+      DOCKER_REGISTRY_PASSWORD: ((docker_registry_password))
+    config:
+      platform: linux
+      inputs:
+      - name: flaskapp-image
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          : "${CI_HOST}" "${CI_USERNAME}" "${CI_PRIVKEY}" "${CI_KNOWN_HOSTS}"
+          : "${DOCKER_REGISTRY_HOSTNAME}" "${DOCKER_REGISTRY_USERNAME}" "${DOCKER_REGISTRY_PASSWORD}"
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+          log "Authorize access to CI deployment minion"
+          mkdir -p "${HOME}/.ssh"
+          echo "${CI_PRIVKEY}" >"${HOME}/.ssh/ci_rsa"
+          chmod 0400 "${HOME}/.ssh/ci_rsa"
+          echo "${CI_PUBKEY}" >"${HOME}/.ssh/ci_rsa.pub"
+          echo "${CI_KNOWN_HOSTS}" >"${HOME}/.ssh/known_hosts"
+
+          # Verify that we can connect.
+          log "Using testbed host:"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" uname -a
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" \
+            docker login "${DOCKER_REGISTRY_HOSTNAME}" \
+            -u "${DOCKER_REGISTRY_USERNAME}" \
+            -p "${DOCKER_REGISTRY_PASSWORD}"
+
+          log 'Generating docker-compose.yml'
+          # Create a docker-compose.yml refering to the exact application image.
+          digest=$(cat flaskapp-image/digest)
+          repository=$(cat flaskapp-image/repository)
+          cat >flaskapp.yml <<EOF
+          # Docker compose file for chatbus application container
+          version: '3.1'
+          networks:
+            flaskapp:
+              driver: bridge
+          services:
+            flaskapp:
+              image: ${repository}@${digest}
+              ports:
+              - 5000:5000
+              networks:
+              - flaskapp
+            redis:
+              image: "redis:alpine"
+              networks:
+              - flaskapp
+          EOF
+          cat flaskapp.yml
+
+          log 'Upload docker-compose.yml to testbed host'
+          scp -i "${HOME}/.ssh/ci_rsa" -r flaskapp.yml "${CI_USERNAME}@${CI_HOST}:flaskapp.yml"
+
+          log 'Starting chatbot application container'
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" \
+            docker-compose -f flaskapp.yml rm -fsv || true
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" \
+            docker-compose -f flaskapp.yml up -d --remove-orphans
+
+          log "Wait for application service to come alive at http://${CI_HOST}:5000"
+          ret=0; until [ "${ret}" -eq 200 ]; do
+            sleep 3
+            ret="$(curl --connect-timeout 3 -w '%{http_code}' -so /dev/null http://${CI_HOST}:5000)" || true
+            echo -n "${ret} "
+          done
+          echo OK
+
+          log 'Capture application startup log detail'
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" docker-compose -f flaskapp.yml logs
+
+          log "Service is up and running at http://${CI_HOST}:5000"
+          log "Waiting 30 seconds before proceeding with teardown"
+          sleep 30
+
+# Dockerized deployment test.
+- name: docker-test
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-tools-image
+    - get: flaskapp-image
+      passed: ['docker-deploy']
+      trigger: true
+      params:
+        skip_download: true
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+          log "Testing chatbot app"
+          log "- curl connection test"
+          ret="$(curl --connect-timeout 3 -w '%{http_code}' -so /dev/null http://${CI_HOST}:5000)" || ret=$?
+          if [ "${ret}" -eq 200 ]; then
+            log "PASS ${ret}"
+          else
+            log "FAIL ${ret}"
+            exit 1
+          fi
+
+# Dockerized deployment teardown.
+- name: docker-destroy
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-tools-image
+    - get: flaskapp-image
+      passed: ['docker-test']
+      trigger: true
+      params:
+        skip_download: true
+  - task: main
+    image: alpine-tools-image
+    timeout: 5m
+    params:
+      CI_HOST: ((ci_minion_hostname))
+      CI_USERNAME: ((ci_minion_username))
+      CI_PRIVKEY: ((ci_minion_privkey))
+      CI_KNOWN_HOSTS: ((ci_minion_known_hosts))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          : "${CI_HOST}" "${CI_USERNAME}" "${CI_PRIVKEY}" "${CI_KNOWN_HOSTS}"
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+          log "Authorize job container to CI deployment minion"
+          mkdir -p "${HOME}/.ssh"
+          echo "${CI_PRIVKEY}" > "${HOME}/.ssh/ci_rsa"
+          chmod 0400 "${HOME}/.ssh/ci_rsa"
+          echo "${CI_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+
+          # Verify that we can connect.
+          log "Using testbed host:"
+          ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" uname -a
+
+          if ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" test -f flaskapp.yml; then
+            log 'Stopping application containers'
+            ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'docker-compose -f flaskapp.yml rm -fsv'
+            ssh -i "${HOME}/.ssh/ci_rsa" "${CI_USERNAME}@${CI_HOST}" 'rm flaskapp.yml'
+          else
+           log 'Host is clean. No ~/flaskapp.yml file found.'
+          fi

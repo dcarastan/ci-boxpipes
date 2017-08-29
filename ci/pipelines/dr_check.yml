@@ -1,0 +1,52 @@
+# Docker registry catalog listing
+
+#-------------------------------------------------------------------------------
+resources:
+- name: alpine-image
+  type: docker-image
+  source:
+    repository: alpine
+    tag: 3.6
+
+# - name: afternoon-time
+#   type: time
+#   source:
+#     start: 12:00 PM
+#     stop: 1:00 PM
+#     location: America/Los_Angeles
+
+- name: interval-time
+  type: time
+  source: {interval: 6h}
+
+#-------------------------------------------------------------------------------
+jobs:
+- name: docker-catalog-list
+  public: true
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: interval-time
+      trigger: true
+  - task: list
+    image: alpine-image
+    timeout: 5m
+    params:
+      CONCOURSE_URL: ((concourse_url))
+      DOCKER_REGISTRY_HOST: ((docker_registry_host))
+      DOCKER_REGISTRY_USERNAME: ((docker_registry_username))
+      DOCKER_REGISTRY_PASSWORD: ((docker_registry_password))
+    config:
+      platform: linux
+      run:
+        path: sh
+        args:
+        - -uec
+        - |
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+          log "Docker registry catalog"
+          apk --no-cache --quiet add curl jq 2>/dev/null
+          curl -sSu "${DOCKER_REGISTRY_USERNAME}:${DOCKER_REGISTRY_PASSWORD}" https://${DOCKER_REGISTRY_HOST}/v2/_catalog | jq .
+          log 'Done!'
+          sleep 5

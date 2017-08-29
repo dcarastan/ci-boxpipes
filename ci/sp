@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Pipeline set tool                                          doru@rocketmail.com
+#
+# Usage: sp <pipeline>|<pipeline file>
+
+# Enforce shell code robustness.
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Show line numbers when tracing execution.
+readonly PS4='${LINENO}:+ '
+readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+
+#-------------------------------------------------------------------------------
+
+if [ -z "${*:-}" ]; then
+  pipelines=(chatbus flaskapp dr_check)
+else
+  pipelines=($@)
+fi
+
+for pipeline in "${pipelines[@]}"; do
+  pipeline="${pipeline##*/}"          # basename
+  pipeline="${pipeline%.yml}"         # drop .yml extension
+  log "Seting pipeline ${pipeline}"
+  fly -t . sp -np "${pipeline}" \
+    -c "${script_dir}/pipelines/${pipeline}.yml" \
+    -l "${script_dir}/credentials.yml"
+  fly -t . ep -p "${pipeline}"
+done

@@ -1,0 +1,227 @@
+---
+#-------------------------------------------------------------------------------
+resources:
+- name: alpine-image
+  type: docker-image
+  source:
+    repository: alpine
+    tag: 3.6
+
+- name: zotonic-src
+  type: git
+  source:
+    uri: https://github.com/zotonic/zotonic
+
+- name: zotonic-image
+  type: docker-image
+  source:
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/chatbus
+
+- name: docker-erlang-otp-src
+  type: git
+  source:
+    uri: https://github.com/c0b/docker-erlang-otp
+
+- name: docker-erlang-otp-image
+  type: docker-image
+  source:
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/docker-erlang-otp
+
+- name: docker-erlang-otp-zotonic-tools-image
+  type: docker-image
+  source:
+    tag: 2.0-zotonic-tools
+    email: ((docker_registry_email))
+    username: ((docker_registry_username))
+    password: ((docker_registry_password))
+    repository: ((docker_registry_host))/docker-erlang-otp
+
+#-------------------------------------------------------------------------------
+jobs:
+- name: docker-erlang-otp-image-build
+  # public: true
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: docker-erlang-otp-src
+      trigger: true
+  - task: mktag
+    image: alpine-image
+    timeout: 5m
+    config:
+      platform: linux
+      outputs:
+      - name: tag
+      run:
+        path: sh
+        args:
+        - -xuec
+        - echo '20' > tag/value
+  - put: docker-erlang-otp-image
+    params:
+      build: docker-erlang-otp-src/20
+      tag: tag/value
+
+- name: docker-erlang-otp-zotonic-tools-image-build
+  # public: true
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: docker-erlang-otp-image
+      passed: ['docker-erlang-otp-image-build']
+      trigger: true
+  - aggregate:
+    - task: mktag
+      image: alpine-image
+      timeout: 3m
+      config:
+        platform: linux
+        outputs:
+        - name: tag
+        run:
+          path: sh
+          args:
+          - -xuec
+          - echo '20-zotonic-tools' > tag/value
+    - task: mkdockerfile
+      image: alpine-image
+      timeout: 3m
+      config:
+        platform: linux
+        outputs:
+        - name: docker
+        params:
+          DOCKER_REGISTRY_HOST: ((docker_registry_host))
+        run:
+          path: sh
+          args:
+          - -xuec
+          - echo -e '
+              FROM ${DOCKER_REGISTRY_HOST}/docker-erlang-otp\n
+              # http://docs.zotonic.com/en/latest/ref/installation/requirements.html#installation-preinstall
+              RUN apk --no-cache add gettext git imagemagick jq less make\n
+              CMD /bin/sh\n' >docker/Dockerfile
+  - put: docker-erlang-otp-tools-image
+    params:
+      build: docker/
+      tag: tag/value
+
+- name: docker-erlang-otp-alpine-image-build
+  # public: true
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: docker-erlang-otp-src
+      trigger: true
+  - task: mktag
+    image: alpine-image
+    timeout: 5m
+    config:
+      platform: linux
+      outputs:
+      - name: tag
+      run:
+        path: sh
+        args:
+        - -xuec
+        - echo '20-alpine' > tag/value
+  - put: docker-erlang-otp-image
+    params:
+      build: docker-erlang-otp-src/20/alpine
+      tag: tag/value
+
+- name: zotonic-build
+  # public: true
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: zotonic-src
+      trigger: true
+    - get: docker-erlang-otp-tools-image
+      passed: ['docker-erlang-otp-tools-image-build']
+      trigger: true
+  - task: build
+    image: docker-erlang-otp-tools-image
+    timeout: 10m
+    input_mapping:
+      src: zotonic-src
+    output_mapping:
+      _build: _build
+    config:
+      platform: linux
+      inputs:
+      - name: src
+      outputs:
+      - name: _build
+      run:
+        path: sh
+        args:
+        - -xuec
+        - |
+          log() { echo "$(date '+%Y-%m-%d %T %Z') $*"; }
+          log "Build started"
+          cd src/
+          ./rebar3 new release chatbus
+          make compile || ./rebar3 update
+          make
+          log "Runing EUnit tests"
+          ./rebar3 eunit
+          # Ignore dyalizer errors for now
+          # ./rebar3 dialyzer || true
+          cp -a _build/* ../_build
+  - task: mkdockerfile
+    image: alpine-image
+    timeout: 3m
+    input_mapping:
+      _build: _build
+    config:
+      platform: linux
+      inputs:
+      - name: _build
+      outputs:
+      - name: docker
+      run:
+        path: sh
+        args:
+        - -xuec
+        - |
+          cp -a _build docker/
+          echo -e '
+            FROM alpine:3.6\n
+            RUN apk --no-cache add ncurses-libs
+            ADD _build/default/rel /rel\n
+            CMD /rel/chatbus/bin/chatbus console\n
+          ' >docker/Dockerfile
+  - put: zotonic-image
+    params:
+      build: docker/
+      tag_as_latest: true
+
+- name: chatbus-deploy
+  # public: true
+  serial: true
+  plan:
+  - aggregate:
+    - get: alpine-image
+    - get: zotonic-image
+      passed: ['zotonic-build']
+      trigger: true
+  # Deployment on concourse worker for now. Let it run for 30 min then kill it.
+  - task: run
+    image: zotonic-image
+    timeout: 30m
+    config:
+      platform: linux
+      run:
+        path: /rel/chatbus/bin/chatbus
+        args: ['console']
